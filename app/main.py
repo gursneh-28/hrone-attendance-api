@@ -18,7 +18,7 @@ from typing import Annotated, Literal, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, model_validator
-from pymongo import ASCENDING, DESCENDING, MongoClient
+from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 load_dotenv()  # override=False by default, so real environment variables take priority
@@ -71,7 +71,9 @@ def ensure_indexes() -> None:
     # attendance list filtered by status.
     db.attendance_logs.create_index(
         [("status", ASCENDING), ("date", DESCENDING), ("emp_code", ASCENDING)], name="status_date_emp")
-
+    # punch-out: latest record of an employee whose punch_in is at or before a given instant.
+    db.attendance_logs.create_index(
+        [("emp_code", ASCENDING), ("punch_in", DESCENDING)], name="emp_punch_in")
 
 # Time helpers (the boundary between epoch milliseconds and aware datetimes)
 def from_ms(ms: int) -> datetime:
@@ -90,6 +92,12 @@ def to_ms(dt: Optional[datetime]) -> Optional[int]:
 
 def now_utc() -> datetime:
     return datetime.now(UTC).replace(microsecond=0)
+
+
+def now_millis() -> datetime:
+    """Current time at millisecond precision (what Mongo stores), for fields like created_at and history.at."""
+    now = datetime.now(UTC)
+    return now.replace(microsecond=now.microsecond // 1000 * 1000)
 
 
 def parse_hhmm(value: str) -> tuple[int, int]:
@@ -208,6 +216,21 @@ class PunchInIn(BaseModel):
     status: PresenceStatus = "PRESENT"
 
 
+class PunchOutIn(BaseModel):
+    emp_code: str = Field(min_length=1)
+    punched_at: Optional[EpochMs] = None
+
+
+class RegularizeIn(BaseModel):
+    # A default of None is not validated, so a field can be omitted, while an explicit null is still a 422.
+    # Derived fields (work_hours, late_minutes, ...) are not declared here, so a client cannot send them.
+    status: Status = None
+    punch_in: EpochMs = None
+    punch_out: EpochMs = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
+
+
 def parse_date_param(value: Optional[str], name: str) -> Optional[str]:
     if value is None:
         return None
@@ -230,8 +253,7 @@ def health():
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
     doc = body.model_dump()
-    now = datetime.now(UTC)
-    doc["created_at"] = now.replace(microsecond=now.microsecond // 1000 * 1000)  # Mongo keeps milliseconds
+    doc["created_at"] = now_millis()
     try:
         db.employees.insert_one(doc)  # the unique index on emp_code decides; no check-then-insert
     except DuplicateKeyError:
@@ -283,6 +305,122 @@ def punch_in(body: PunchInIn):
     return serialize_attendance(doc)
 
 
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    ts = from_ms(body.punched_at) if body.punched_at is not None else now_utc()
+
+    # The employee's most recent record whose punch_in is at or before the punch-out. Looking at punch_in
+    # (not at the date) is what makes this work across midnight for overnight shifts.
+    rec = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$lte": ts}},
+        sort=[("punch_in", DESCENDING)],
+    )
+    if rec is None:
+        raise HTTPException(404, "no punch-in found")
+    if rec.get("punch_out") is not None:
+        raise HTTPException(409, "already punched out")
+
+    punched_in = rec["punch_in"].replace(microsecond=0)
+    if ts <= punched_in or ts - punched_in > timedelta(hours=24):
+        raise HTTPException(422, "punched_at must be after punch_in and within 24 hours of it")
+
+    _, shift_end_dt = shift_window(rec["date"], emp["shift_start"], emp["shift_end"])
+    work_hours = compute_work_hours(punched_in, ts)
+    # The filter "punch_out is null" makes the close atomic: of two simultaneous punch-outs only one matches.
+    updated = db.attendance_logs.find_one_and_update(
+        {"_id": rec["_id"], "punch_out": None},
+        {"$set": {
+            "punch_out": ts,
+            "work_hours": work_hours,
+            "overtime_minutes": compute_overtime(ts, shift_end_dt),
+            "half_day": compute_half_day(work_hours),
+        }},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "already punched out")
+    return serialize_attendance(updated)
+
+
+HISTORY_FIELDS = ("status", "punch_in", "punch_out", "work_hours", "late_minutes", "overtime_minutes", "half_day")
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):  # `date` = the record's attendance date
+    parse_date_param(date, "date")
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    rec = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if rec is None:
+        raise HTTPException(404, "no attendance record for that date")
+
+    # What is stored now, with missing legacy fields read as 0 / false (same defaults as the API output).
+    old = {
+        "status": rec["status"],
+        "punch_in": rec["punch_in"].replace(microsecond=0) if rec.get("punch_in") else None,
+        "punch_out": rec["punch_out"].replace(microsecond=0) if rec.get("punch_out") else None,
+        "work_hours": rec.get("work_hours"),
+        "late_minutes": rec.get("late_minutes") or 0,
+        "overtime_minutes": rec.get("overtime_minutes") or 0,
+        "half_day": bool(rec.get("half_day", False)),
+    }
+
+    # Apply the request to get the final times, validating the rules of the contract.
+    new_status = body.status or old["status"]
+    if new_status in ("ABSENT", "LEAVE"):
+        if body.punch_in is not None or body.punch_out is not None:
+            raise HTTPException(422, "ABSENT and LEAVE clear the punch times; do not supply punch_in or punch_out")
+        new_in = new_out = None
+    else:
+        new_in = from_ms(body.punch_in) if body.punch_in is not None else old["punch_in"]
+        new_out = from_ms(body.punch_out) if body.punch_out is not None else old["punch_out"]
+        if new_in is None:
+            raise HTTPException(422, "a presence status requires a punch_in")
+        if body.punch_in is not None and attendance_date(new_in, emp["shift_start"], emp["shift_end"]) != date:
+            raise HTTPException(422, "punch_in must stay on the record's attendance date")
+        if new_out is not None and (new_out <= new_in or new_out - new_in > timedelta(hours=24)):
+            raise HTTPException(422, "punch_out must be after punch_in and within 24 hours of it")
+
+    # Recompute every derived field from the final times (R2 - R5).
+    shift_start_dt, shift_end_dt = shift_window(date, emp["shift_start"], emp["shift_end"])
+    new = {"status": new_status, "punch_in": new_in, "punch_out": new_out,
+           "work_hours": None, "late_minutes": 0, "overtime_minutes": 0, "half_day": False}
+    if new_in is not None:
+        new["late_minutes"] = compute_late_minutes(new_in, shift_start_dt)
+    if new_out is not None:
+        new["work_hours"] = compute_work_hours(new_in, new_out)
+        new["overtime_minutes"] = compute_overtime(new_out, shift_end_dt)
+        new["half_day"] = compute_half_day(new["work_hours"])
+
+    changes = {f: {"from": old[f], "to": new[f]} for f in HISTORY_FIELDS if old[f] != new[f]}
+    if not changes:
+        raise HTTPException(422, "the request changes nothing")
+
+    # Optimistic concurrency: the update only applies if the record is still exactly what we read
+    # (same status and punch times, and nobody appended to history). Otherwise 409 and nothing is lost.
+    n = len(rec.get("history") or [])
+    still_unchanged = {
+        "_id": rec["_id"],
+        "status": rec["status"],
+        "punch_in": rec.get("punch_in"),
+        "punch_out": rec.get("punch_out"),
+        f"history.{n}": {"$exists": False},
+    }
+    entry = {"at": now_millis(), "by": body.regularized_by, "reason": body.reason, "changes": changes}
+    updated = db.attendance_logs.find_one_and_update(
+        still_unchanged,
+        {"$set": {f: new[f] for f in HISTORY_FIELDS}, "$push": {"history": entry}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "the record was modified by someone else; reload and retry")
+    return serialize_attendance(updated)
+
+
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
@@ -316,9 +454,8 @@ def list_attendance(
     )
     return {"items": [serialize_attendance(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
+
 # TODO - Part B (see openapi.yaml):
-#   POST  /attendance/punch-out
-#   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
