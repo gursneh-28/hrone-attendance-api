@@ -63,6 +63,8 @@ def ensure_indexes() -> None:
     db.employees.create_index([("emp_code", ASCENDING)], unique=True, name="uq_emp_code")
     # employees filtered by department and sorted by emp_code.
     db.employees.create_index([("department", ASCENDING), ("emp_code", ASCENDING)], name="dept_emp_code")
+    # department headcount: employees joined by a given day, grouped by department (answered from the index alone).
+    db.employees.create_index([("joined_on", ASCENDING), ("department", ASCENDING)], name="joined_dept")
     # attendance: one record per (emp_code, date) -> unique (race-safe punch-in; also serves emp_code filters).
     db.attendance_logs.create_index(
         [("emp_code", ASCENDING), ("date", ASCENDING)], unique=True, name="uq_emp_date")
@@ -76,7 +78,10 @@ def ensure_indexes() -> None:
     db.attendance_logs.create_index(
         [("emp_code", ASCENDING), ("punch_in", DESCENDING)], name="emp_punch_in")
 
+
+# --------------------------------------------------------------------------- #
 # Time helpers (the boundary between epoch milliseconds and aware datetimes)
+# --------------------------------------------------------------------------- #
 def from_ms(ms: int) -> datetime:
     """Epoch milliseconds -> aware UTC datetime, truncated to whole seconds (R1)."""
     return (EPOCH + timedelta(milliseconds=ms)).replace(microsecond=0)
@@ -128,10 +133,7 @@ def shift_window(date_str: str, shift_start: str, shift_end: str) -> tuple[datet
     end = datetime.combine(end_day, time(*parse_hhmm(shift_end)), tzinfo=IST)
     return start.astimezone(UTC), end.astimezone(UTC)
 
-
-# --------------------------------------------------------------------------- #
 # Business-rule helpers (R2 - R5)
-# --------------------------------------------------------------------------- #
 def compute_late_minutes(punch_in: datetime, shift_start_dt: datetime) -> int:
     """R2: late only if strictly more than 600 s after shift start; then whole minutes since shift start."""
     seconds = int((punch_in - shift_start_dt).total_seconds())
@@ -489,7 +491,6 @@ def list_attendance(
     )
     return {"items": [serialize_attendance(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
-
 # Analytics
 def present_credit(weekends: list[str]) -> dict:
     """Aggregation expression: how many present days one record is worth (R5 - R7).
@@ -538,8 +539,78 @@ def employee_monthly(emp_code: str, month: str = Query(pattern=MONTH_RE)):
         "attendance_pct": round_half_up(Decimal(str(present)) * 100 / Decimal(days), 2) if days else None,
     }
 
+
+def hundredths(field: str) -> dict:
+    """work_hours as an exact whole number of hundredths (9.12 -> 912), so sums and averages carry no float error."""
+    return {"$floor": {"$add": [{"$multiply": [field, 100]}, 0.5]}}
+
+
+def department_activity_pipeline(first: date, next_first: date, department: Optional[str]) -> list[dict]:
+    """Attendance records of the month joined to their employee, grouped by the employee's department (R6, R9).
+    Only employees that count towards the headcount (joined on or before the last day of the month) are included;
+    logs whose employee does not exist are dropped by the $unwind."""
+    last_day = (next_first - timedelta(days=1)).isoformat()
+    employee_filter: dict = {"emp.joined_on": {"$lte": last_day}}
+    if department:
+        employee_filter["emp.department"] = department
+    # "present-status AND has a numeric work_hours" is the population of the average (open records are excluded).
+    counts_for_avg = {"$and": [
+        {"$in": ["$status", list(PRESENCE)]},
+        {"$ne": [{"$ifNull": ["$work_hours", None]}, None]},   # a missing field and null both become null
+    ]}
+    return [
+        {"$match": {"date": {"$gte": first.isoformat(), "$lt": next_first.isoformat()}}},
+        {"$lookup": {"from": "employees", "localField": "emp_code", "foreignField": "emp_code", "as": "emp"}},
+        {"$unwind": "$emp"},
+        {"$match": employee_filter},
+        {"$group": {
+            "_id": "$emp.department",
+            "present_days": {"$sum": present_credit(weekend_dates(first, next_first))},
+            "hours_records": {"$sum": {"$cond": [counts_for_avg, 1, 0]}},
+            "hours_in_hundredths": {"$sum": {"$cond": [counts_for_avg, hundredths("$work_hours"), 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+            "leave_count": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+            "on_duty_count": {"$sum": {"$cond": [{"$eq": ["$status", "ON_DUTY"]}, 1, 0]}},
+        }},
+    ]
+
+
+def department_headcount_pipeline(next_first: date, department: Optional[str]) -> list[dict]:
+    """R9: employees who joined on or before the last day of the month, with or without any logs."""
+    match: dict = {"joined_on": {"$lte": (next_first - timedelta(days=1)).isoformat()}}
+    if department:
+        match["department"] = department
+    return [
+        {"$match": match},
+        {"$group": {"_id": "$department", "headcount": {"$sum": 1}}},
+        {"$sort": {"_id": 1}},
+    ]
+
+
+@app.get("/analytics/departments/summary")
+def department_summary(month: str = Query(pattern=MONTH_RE), department: Optional[str] = None):
+    first, next_first = month_bounds(month)
+    activity = {r["_id"]: r for r in db.attendance_logs.aggregate(department_activity_pipeline(first, next_first, department))}
+    items = []
+    # The headcount query drives the output: a department with no logs still shows up, one with headcount 0 does not.
+    for h in db.employees.aggregate(department_headcount_pipeline(next_first, department)):
+        a = activity.get(h["_id"], {})
+        n = int(a.get("hours_records", 0))
+        avg = round_half_up(Decimal(int(a["hours_in_hundredths"])) / Decimal(100 * n), 2) if n else None
+        items.append({
+            "department": h["_id"],
+            "headcount": h["headcount"],
+            "present_days": float(a.get("present_days", 0)),
+            "avg_work_hours": avg,
+            "late_count": int(a.get("late_count", 0)),
+            "total_late_minutes": int(a.get("total_late_minutes", 0)),
+            "leave_count": int(a.get("leave_count", 0)),
+            "on_duty_count": int(a.get("on_duty_count", 0)),
+        })
+    return {"month": month, "items": items}
+
 # TODO - Part B (see openapi.yaml):
-#   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
