@@ -65,6 +65,8 @@ def ensure_indexes() -> None:
     db.employees.create_index([("department", ASCENDING), ("emp_code", ASCENDING)], name="dept_emp_code")
     # department headcount: employees joined by a given day, grouped by department (answered from the index alone).
     db.employees.create_index([("joined_on", ASCENDING), ("department", ASCENDING)], name="joined_dept")
+    # department trend: every joined_on of a department, read from the index alone.
+    db.employees.create_index([("department", ASCENDING), ("joined_on", ASCENDING)], name="dept_joined")
     # attendance: one record per (emp_code, date) -> unique (race-safe punch-in; also serves emp_code filters).
     db.attendance_logs.create_index(
         [("emp_code", ASCENDING), ("date", ASCENDING)], unique=True, name="uq_emp_date")
@@ -677,6 +679,103 @@ def late_leaderboard(
     } for r in rows]
     return {"month": month, "items": items}
 
+
+MAX_TREND_DAYS = 92
+RATE_UNITS = 10_000  # rates are carried as whole numbers of 1/10000, which makes 4-decimal half-up rounding exact
+
+
+def trend_pipeline(department: str, codes: list[str], first: date, last: date) -> list[dict]:
+    """One row per calendar day from `first` to `last`, built entirely inside MongoDB.
+    employees (one document for the department) -> calendar days via $range/$unwind -> per-day attendance via
+    $lookup -> rates -> 7-day moving average via a window function."""
+    days = (last - first).days + 1
+    start = datetime.combine(first, time(0), tzinfo=UTC)
+    return [
+        # One document carrying the joined_on of every employee of the department (this is also the 404 guard's data).
+        {"$match": {"department": department}},
+        {"$group": {"_id": None, "joined": {"$push": "$joined_on"}}},
+        # The calendar: day 0 .. day N-1 as dates, then one document per day (weekends and empty days included).
+        {"$project": {"_id": 0, "joined": 1, "day": {"$map": {
+            "input": {"$range": [0, days]}, "as": "i",
+            "in": {"$add": [start, {"$multiply": ["$$i", 86400000]}]}}}}},
+        {"$unwind": "$day"},
+        {"$addFields": {
+            "date": {"$dateToString": {"format": "%Y-%m-%d", "date": "$day"}},
+            "is_working_day": {"$lte": [{"$isoDayOfWeek": "$day"}, 5]},
+        }},
+        # That day's attendance of the department's employees (equality on date uses the (date, emp_code) index).
+        {"$lookup": {
+            "from": "attendance_logs", "localField": "date", "foreignField": "date",
+            "pipeline": [
+                {"$match": {"emp_code": {"$in": codes}}},
+                {"$group": {
+                    "_id": None,
+                    "present_count": {"$sum": present_credit([])},  # any weekday or weekend
+                    "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+                }},
+            ],
+            "as": "stats",
+        }},
+        {"$addFields": {
+            # R9: employees who joined on or before that day (YYYY-MM-DD strings compare like dates).
+            "headcount": {"$size": {"$filter": {"input": "$joined", "as": "j", "cond": {"$lte": ["$$j", "$date"]}}}},
+            "present_count": {"$ifNull": [{"$arrayElemAt": ["$stats.present_count", 0]}, 0]},
+            "late_count": {"$ifNull": [{"$arrayElemAt": ["$stats.late_count", 0]}, 0]},
+        }},
+        # attendance_rate in units of 1/10000, half-up: floor(present / headcount * 10000 + 0.5).
+        # Only on working days with a headcount; a working day with no records is 0.
+        {"$addFields": {"rate_units": {"$cond": [
+            {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
+            {"$floor": {"$add": [
+                {"$divide": [{"$multiply": ["$present_count", 2 * RATE_UNITS]}, {"$multiply": ["$headcount", 2]}]},
+                0.5]}},
+            None,
+        ]}}},
+        # Mean of the non-null rates in the current row and up to 6 rows before it; the window never reaches before
+        # the first requested day, so the first rows use a shorter window. $avg ignores nulls (all null -> null).
+        {"$setWindowFields": {
+            "sortBy": {"date": 1},
+            "output": {"avg_units": {"$avg": "$rate_units", "window": {"documents": [-6, 0]}}},
+        }},
+        {"$sort": {"date": 1}},
+        {"$project": {
+            "_id": 0, "date": 1, "is_working_day": 1, "headcount": 1, "present_count": 1, "late_count": 1,
+            "attendance_rate": {"$cond": [{"$eq": ["$rate_units", None]}, None, {"$divide": ["$rate_units", RATE_UNITS]}]},
+            "moving_avg_7d": {"$cond": [
+                {"$eq": ["$avg_units", None]}, None,
+                {"$divide": [{"$floor": {"$add": ["$avg_units", 0.5]}}, RATE_UNITS]}]},
+        }},
+    ]
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+    department: str,
+    date_from: str = Query(alias="from", pattern=YMD),
+    date_to: str = Query(alias="to", pattern=YMD),
+):
+    first = date.fromisoformat(parse_date_param(date_from, "from"))
+    last = date.fromisoformat(parse_date_param(date_to, "to"))
+    if last < first:
+        raise HTTPException(422, "to must not be before from")
+    if (last - first).days + 1 > MAX_TREND_DAYS:
+        raise HTTPException(422, f"the range must not exceed {MAX_TREND_DAYS} days")
+    codes = db.employees.distinct("emp_code", {"department": department})
+    if not codes:
+        raise HTTPException(404, "unknown department")
+    rows = db.employees.aggregate(trend_pipeline(department, codes, first, last))
+    return {"department": department, "items": [{
+        "date": r["date"],
+        "is_working_day": bool(r["is_working_day"]),
+        "headcount": int(r["headcount"]),
+        "present_count": float(r["present_count"]),
+        "late_count": int(r["late_count"]),
+        "attendance_rate": r["attendance_rate"],
+        "moving_avg_7d": r["moving_avg_7d"],
+    } for r in rows]}
+
+
+ 
 # TODO - Part B (see openapi.yaml):
-#   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
+ 
