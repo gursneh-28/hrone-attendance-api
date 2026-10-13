@@ -45,6 +45,7 @@ EpochMs = Annotated[int, Field(strict=True, ge=EPOCH_MS_MIN, le=EPOCH_MS_MAX)]
 
 HHMM = r"^([01]\d|2[0-3]):[0-5]\d$"
 YMD = r"^\d{4}-\d{2}-\d{2}$"
+MONTH_RE = r"^\d{4}-(0[1-9]|1[0-2])$"
 
 
 @asynccontextmanager
@@ -127,7 +128,10 @@ def shift_window(date_str: str, shift_start: str, shift_end: str) -> tuple[datet
     end = datetime.combine(end_day, time(*parse_hhmm(shift_end)), tzinfo=IST)
     return start.astimezone(UTC), end.astimezone(UTC)
 
+
+# --------------------------------------------------------------------------- #
 # Business-rule helpers (R2 - R5)
+# --------------------------------------------------------------------------- #
 def compute_late_minutes(punch_in: datetime, shift_start_dt: datetime) -> int:
     """R2: late only if strictly more than 600 s after shift start; then whole minutes since shift start."""
     seconds = int((punch_in - shift_start_dt).total_seconds())
@@ -188,6 +192,37 @@ def serialize_attendance(doc: dict) -> dict:
         "half_day": bool(doc.get("half_day", False)),
         "history": [serialize_history_entry(h) for h in doc.get("history") or []],
     }
+
+# Calendar and rounding helpers for the analytics endpoints
+def round_half_up(value, places: int = 2) -> float:
+    """R8: half-up rounding. Going through str() uses the shortest repr of a float, so 2.675 stays 2.675."""
+    return float(Decimal(str(value)).quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP))
+
+
+def month_bounds(month: str) -> tuple[date, date]:
+    """'2026-09' -> (first day of the month, first day of the next month); 422 for an impossible month."""
+    try:
+        first = date(int(month[:4]), int(month[5:7]), 1)
+    except ValueError:
+        raise HTTPException(422, "month must be a real month in YYYY-MM format")
+    return first, (first.replace(day=28) + timedelta(days=4)).replace(day=1)
+
+
+def days_between(start: date, end: date):
+    """Every date from start up to (not including) end."""
+    for i in range((end - start).days):
+        yield start + timedelta(days=i)
+
+
+def weekend_dates(start: date, end: date) -> list[str]:
+    """The Saturdays and Sundays in [start, end) as YYYY-MM-DD strings (R7: weekends are not working days)."""
+    return [d.isoformat() for d in days_between(start, end) if d.weekday() >= 5]
+
+
+def working_days(first: date, next_first: date, joined_on: str) -> int:
+    """R7: Monday-Friday in the month, counted from joined_on for someone who joined mid-month."""
+    start = max(first, date.fromisoformat(joined_on))
+    return sum(1 for d in days_between(start, next_first) if d.weekday() < 5)
 
 # Models
 class EmployeeIn(BaseModel):
@@ -455,8 +490,55 @@ def list_attendance(
     return {"items": [serialize_attendance(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
 
+# Analytics
+def present_credit(weekends: list[str]) -> dict:
+    """Aggregation expression: how many present days one record is worth (R5 - R7).
+    A presence status on Monday-Friday is 1 (0.5 for a half day); anything else is 0."""
+    return {"$cond": [
+        {"$and": [{"$in": ["$status", list(PRESENCE)]}, {"$eq": [{"$in": ["$date", weekends]}, False]}]},
+        {"$cond": [{"$ifNull": ["$half_day", False]}, 0.5, 1]},
+        0,
+    ]}
+
+
+def monthly_pipeline(emp_code: str, first: date, next_first: date) -> list[dict]:
+    """One employee, one month. Reads the STORED derived values (late_minutes, overtime_minutes, half_day)."""
+    return [
+        {"$match": {"emp_code": emp_code, "date": {"$gte": first.isoformat(), "$lt": next_first.isoformat()}}},
+        {"$group": {
+            "_id": None,
+            "present_days": {"$sum": present_credit(weekend_dates(first, next_first))},
+            "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+            "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+        }},
+    ]
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(emp_code: str, month: str = Query(pattern=MONTH_RE)):
+    first, next_first = month_bounds(month)
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    rows = list(db.attendance_logs.aggregate(monthly_pipeline(emp_code, first, next_first)))
+    agg = rows[0] if rows else {}
+    present = float(agg.get("present_days", 0))
+    days = working_days(first, next_first, emp["joined_on"])
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": days,
+        "present_days": present,
+        "leave_days": int(agg.get("leave_days", 0)),
+        "late_count": int(agg.get("late_count", 0)),
+        "total_late_minutes": int(agg.get("total_late_minutes", 0)),
+        "total_overtime_minutes": int(agg.get("total_overtime_minutes", 0)),
+        "attendance_pct": round_half_up(Decimal(str(present)) * 100 / Decimal(days), 2) if days else None,
+    }
+
 # TODO - Part B (see openapi.yaml):
-#   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
