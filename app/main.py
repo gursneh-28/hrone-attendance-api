@@ -79,9 +79,9 @@ def ensure_indexes() -> None:
         [("emp_code", ASCENDING), ("punch_in", DESCENDING)], name="emp_punch_in")
 
 
-# --------------------------------------------------------------------------- #
+ 
 # Time helpers (the boundary between epoch milliseconds and aware datetimes)
-# --------------------------------------------------------------------------- #
+ 
 def from_ms(ms: int) -> datetime:
     """Epoch milliseconds -> aware UTC datetime, truncated to whole seconds (R1)."""
     return (EPOCH + timedelta(milliseconds=ms)).replace(microsecond=0)
@@ -133,7 +133,10 @@ def shift_window(date_str: str, shift_start: str, shift_end: str) -> tuple[datet
     end = datetime.combine(end_day, time(*parse_hhmm(shift_end)), tzinfo=IST)
     return start.astimezone(UTC), end.astimezone(UTC)
 
+
+ 
 # Business-rule helpers (R2 - R5)
+ 
 def compute_late_minutes(punch_in: datetime, shift_start_dt: datetime) -> int:
     """R2: late only if strictly more than 600 s after shift start; then whole minutes since shift start."""
     seconds = int((punch_in - shift_start_dt).total_seconds())
@@ -156,7 +159,10 @@ def compute_half_day(work_hours: Optional[float]) -> bool:
     """R5: after punch-out, true when the rounded work_hours < 4.50."""
     return work_hours is not None and work_hours < 4.5
 
+
+ 
 # Serialisation (Mongo document -> API shape)
+ 
 def serialize_employee(doc: dict) -> dict:
     return {
         "emp_code": doc["emp_code"],
@@ -195,7 +201,10 @@ def serialize_attendance(doc: dict) -> dict:
         "history": [serialize_history_entry(h) for h in doc.get("history") or []],
     }
 
+
+ 
 # Calendar and rounding helpers for the analytics endpoints
+ 
 def round_half_up(value, places: int = 2) -> float:
     """R8: half-up rounding. Going through str() uses the shortest repr of a float, so 2.675 stays 2.675."""
     return float(Decimal(str(value)).quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP))
@@ -226,7 +235,10 @@ def working_days(first: date, next_first: date, joined_on: str) -> int:
     start = max(first, date.fromisoformat(joined_on))
     return sum(1 for d in days_between(start, next_first) if d.weekday() < 5)
 
+
+ 
 # Models
+ 
 class EmployeeIn(BaseModel):
     emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
     name: str = Field(min_length=1, max_length=100)
@@ -277,7 +289,10 @@ def parse_date_param(value: Optional[str], name: str) -> Optional[str]:
         raise HTTPException(422, f"{name} must be a real date in YYYY-MM-DD format")
     return value
 
+
+ 
 # Endpoints
+ 
 @app.get("/health")
 def health():
     try:
@@ -491,7 +506,10 @@ def list_attendance(
     )
     return {"items": [serialize_attendance(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
+
+ 
 # Analytics
+ 
 def present_credit(weekends: list[str]) -> dict:
     """Aggregation expression: how many present days one record is worth (R5 - R7).
     A presence status on Monday-Friday is 1 (0.5 for a half day); anything else is 0."""
@@ -610,7 +628,55 @@ def department_summary(month: str = Query(pattern=MONTH_RE), department: Optiona
         })
     return {"month": month, "items": items}
 
+
+def late_leaderboard_pipeline(first: date, next_first: date, limit: int, department: Optional[str]) -> list[dict]:
+    """Employees ranked by total late minutes in the month, highest first (only totals > 0).
+    $rank is standard competition ranking: ties share a rank and the next rank is skipped (1, 2, 2, 4).
+    The limit is applied to the RANK, after ranking, so a tie at the cutoff returns more than `limit` rows."""
+    pipeline: list[dict] = [
+        {"$match": {"date": {"$gte": first.isoformat(), "$lt": next_first.isoformat()}}},
+        {"$group": {
+            "_id": "$emp_code",
+            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+        }},
+        {"$match": {"total_late_minutes": {"$gt": 0}}},
+        {"$lookup": {"from": "employees", "localField": "_id", "foreignField": "emp_code", "as": "emp"}},
+        {"$unwind": "$emp"},  # a log whose employee does not exist is dropped here
+    ]
+    if department:
+        # Filter BEFORE ranking: with a department the ranking happens inside that department only.
+        pipeline.append({"$match": {"emp.department": department}})
+    pipeline += [
+        {"$setWindowFields": {"sortBy": {"total_late_minutes": -1}, "output": {"rank": {"$rank": {}}}}},
+        {"$match": {"rank": {"$lte": limit}}},
+        {"$sort": {"total_late_minutes": -1, "_id": 1}},  # tied rows are ordered by emp_code
+        {"$project": {
+            "_id": 0, "rank": 1, "emp_code": "$_id", "name": "$emp.name", "department": "$emp.department",
+            "total_late_minutes": 1, "late_count": 1,
+        }},
+    ]
+    return pipeline
+
+
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(
+    month: str = Query(pattern=MONTH_RE),
+    limit: int = Query(10, ge=1, le=50),
+    department: Optional[str] = None,
+):
+    first, next_first = month_bounds(month)
+    rows = db.attendance_logs.aggregate(late_leaderboard_pipeline(first, next_first, limit, department))
+    items = [{
+        "rank": int(r["rank"]),
+        "emp_code": r["emp_code"],
+        "name": r["name"],
+        "department": r["department"],
+        "total_late_minutes": int(r["total_late_minutes"]),
+        "late_count": int(r["late_count"]),
+    } for r in rows]
+    return {"month": month, "items": items}
+
 # TODO - Part B (see openapi.yaml):
-#   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
