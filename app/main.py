@@ -10,12 +10,15 @@ Time convention used everywhere in this file:
   * IST (UTC+05:30) is used only to get a calendar date or to place a shift time (R1).
 """
 import os
+import json
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
+from bson import json_util
+from bson.son import SON
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, model_validator
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
@@ -475,15 +478,12 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):  # `dat
     return serialize_attendance(updated)
 
 
-@app.get("/attendance")
-def list_attendance(
-    emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[Status] = None,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-):
+ATTENDANCE_SORT = [("date", DESCENDING), ("emp_code", ASCENDING)]  # date desc, then emp_code asc
+
+
+def attendance_query(emp_code: Optional[str], date_from: Optional[str], date_to: Optional[str],
+                     status: Optional[str]) -> dict:
+    """The filter of GET /attendance (also used by the explain endpoint, so both run the very same query)."""
     date_from = parse_date_param(date_from, "date_from")
     date_to = parse_date_param(date_to, "date_to")
     if date_from and date_to and date_from > date_to:
@@ -499,10 +499,23 @@ def list_attendance(
             q["date"]["$lte"] = date_to
     if status:
         q["status"] = status
+    return q
+
+
+@app.get("/attendance")
+def list_attendance(
+    emp_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[Status] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    q = attendance_query(emp_code, date_from, date_to, status)
     total = db.attendance_logs.count_documents(q)
     cursor = (
         db.attendance_logs.find(q)
-        .sort([("date", DESCENDING), ("emp_code", ASCENDING)])  # sorted by the database, not in Python
+        .sort(ATTENDANCE_SORT)  # sorted by the database, not in Python
         .skip((page - 1) * page_size)
         .limit(page_size)
     )
@@ -748,12 +761,8 @@ def trend_pipeline(department: str, codes: list[str], first: date, last: date) -
     ]
 
 
-@app.get("/analytics/departments/{department}/trend")
-def department_trend(
-    department: str,
-    date_from: str = Query(alias="from", pattern=YMD),
-    date_to: str = Query(alias="to", pattern=YMD),
-):
+def prepare_trend(department: str, date_from: str, date_to: str) -> list[dict]:
+    """Validate the request and build the trend pipeline (shared by the endpoint and the explain endpoint)."""
     first = date.fromisoformat(parse_date_param(date_from, "from"))
     last = date.fromisoformat(parse_date_param(date_to, "to"))
     if last < first:
@@ -763,7 +772,16 @@ def department_trend(
     codes = db.employees.distinct("emp_code", {"department": department})
     if not codes:
         raise HTTPException(404, "unknown department")
-    rows = db.employees.aggregate(trend_pipeline(department, codes, first, last))
+    return trend_pipeline(department, codes, first, last)
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+    department: str,
+    date_from: str = Query(alias="from", pattern=YMD),
+    date_to: str = Query(alias="to", pattern=YMD),
+):
+    rows = db.employees.aggregate(prepare_trend(department, date_from, date_to))
     return {"department": department, "items": [{
         "date": r["date"],
         "is_working_day": bool(r["is_working_day"]),
@@ -775,7 +793,63 @@ def department_trend(
     } for r in rows]}
 
 
+
+# Admin: explain
  
-# TODO - Part B (see openapi.yaml):
-#   GET   /admin/explain/{endpoint}
- 
+ExplainTarget = Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard",
+                        "department_trend"]
+
+
+def require(**params) -> None:
+    missing = [k for k, v in params.items() if v is None]
+    if missing:
+        raise HTTPException(422, "missing required parameter(s): " + ", ".join(missing))
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: ExplainTarget,
+    emp_code: Optional[str] = None,
+    month: Optional[str] = Query(None, pattern=MONTH_RE),
+    department: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=50),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[Status] = None,
+    from_: Optional[str] = Query(None, alias="from", pattern=YMD),
+    to: Optional[str] = Query(None, alias="to", pattern=YMD),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    """MongoDB's explain (executionStats) of the main query/pipeline of an endpoint, built by the same functions
+    that the endpoint itself uses, so the plan shown is the plan that runs."""
+    if endpoint == "attendance_list":
+        collection = "attendance_logs"
+        command = {
+            "find": collection,
+            "filter": attendance_query(emp_code, date_from, date_to, status),
+            "sort": SON(ATTENDANCE_SORT),
+            "skip": (page - 1) * page_size,
+            "limit": page_size,
+        }
+    else:
+        if endpoint == "department_trend":
+            require(department=department, **{"from": from_, "to": to})
+            collection, pipeline = "employees", prepare_trend(department, from_, to)
+        else:
+            if endpoint == "employee_monthly":
+                require(emp_code=emp_code, month=month)
+            else:
+                require(month=month)
+            first, next_first = month_bounds(month)
+            collection = "attendance_logs"
+            if endpoint == "employee_monthly":
+                pipeline = monthly_pipeline(emp_code, first, next_first)
+            elif endpoint == "department_summary":
+                pipeline = department_activity_pipeline(first, next_first, department)
+            else:
+                pipeline = late_leaderboard_pipeline(first, next_first, limit, department)
+        command = {"aggregate": collection, "pipeline": pipeline, "cursor": {}}
+    raw = db.command({"explain": command, "verbosity": "executionStats"})
+    # The explain document can hold BSON types (Int64, Timestamp, ...): convert to plain JSON.
+    return {"endpoint": endpoint, "collection": collection, "explain": json.loads(json_util.dumps(raw))}
