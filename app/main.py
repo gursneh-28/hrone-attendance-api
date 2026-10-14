@@ -11,6 +11,7 @@ Time convention used everywhere in this file:
 """
 import os
 import json
+import re
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
@@ -99,6 +100,14 @@ def to_ms(dt: Optional[datetime]) -> Optional[int]:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return (dt - EPOCH) // timedelta(milliseconds=1)
+
+
+MAX_SKIP = 2**62  # far beyond any real collection, but small enough for MongoDB's 64-bit integers
+
+
+def page_skip(page: int, page_size: int) -> int:
+    """Documents to skip for a page. Capped so an absurd `page` returns an empty page instead of overflowing."""
+    return min((page - 1) * page_size, MAX_SKIP)
 
 
 def now_utc() -> datetime:
@@ -289,6 +298,9 @@ def parse_date_param(value: Optional[str], name: str) -> Optional[str]:
     if value is None:
         return None
     try:
+        # fromisoformat alone also accepts spellings like 20261102 or 2026-W45-1, so the shape is checked first.
+        if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+            raise ValueError(value)
         date.fromisoformat(value)
     except ValueError:
         raise HTTPException(422, f"{name} must be a real date in YYYY-MM-DD format")
@@ -329,7 +341,7 @@ def list_employees(
     cursor = (
         db.employees.find(q)
         .sort("emp_code", ASCENDING)
-        .skip((page - 1) * page_size)
+        .skip(page_skip(page, page_size))
         .limit(page_size)
     )
     return {"items": [serialize_employee(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
@@ -516,7 +528,7 @@ def list_attendance(
     cursor = (
         db.attendance_logs.find(q)
         .sort(ATTENDANCE_SORT)  # sorted by the database, not in Python
-        .skip((page - 1) * page_size)
+        .skip(page_skip(page, page_size))
         .limit(page_size)
     )
     return {"items": [serialize_attendance(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
@@ -835,7 +847,7 @@ def explain_endpoint(
             "find": collection,
             "filter": attendance_query(emp_code, date_from, date_to, status),
             "sort": SON(ATTENDANCE_SORT),
-            "skip": (page - 1) * page_size,
+            "skip": page_skip(page, page_size),
             "limit": page_size,
         }
     else:
