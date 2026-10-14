@@ -9,3 +9,5 @@ PROBLEM_STATEMENT.docx
 openapi.yaml
 DATA_MODEL.md
 sample_data/
+scale_test.py
+scale_server.log
