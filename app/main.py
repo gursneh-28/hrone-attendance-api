@@ -579,9 +579,10 @@ def hundredths(field: str) -> dict:
 
 
 def department_activity_pipeline(first: date, next_first: date, department: Optional[str]) -> list[dict]:
-    """Attendance records of the month joined to their employee, grouped by the employee's department (R6, R9).
+    """Attendance records of the month, totalled per employee first (so the join to `employees` happens once per
+    employee, not once per record), then grouped by the employee's department (R6, R9).
     Only employees that count towards the headcount (joined on or before the last day of the month) are included;
-    logs whose employee does not exist are dropped by the $unwind."""
+    logs whose employee does not exist are dropped by the $unwind. Every total is a sum, so totals of totals are exact."""
     last_day = (next_first - timedelta(days=1)).isoformat()
     employee_filter: dict = {"emp.joined_on": {"$lte": last_day}}
     if department:
@@ -591,13 +592,13 @@ def department_activity_pipeline(first: date, next_first: date, department: Opti
         {"$in": ["$status", list(PRESENCE)]},
         {"$ne": [{"$ifNull": ["$work_hours", None]}, None]},   # a missing field and null both become null
     ]}
+    totals = ("present_days", "hours_records", "hours_in_hundredths", "late_count", "total_late_minutes",
+              "leave_count", "on_duty_count")
     return [
         {"$match": {"date": {"$gte": first.isoformat(), "$lt": next_first.isoformat()}}},
-        {"$lookup": {"from": "employees", "localField": "emp_code", "foreignField": "emp_code", "as": "emp"}},
-        {"$unwind": "$emp"},
-        {"$match": employee_filter},
+        # Step 1: one row per employee (about as many rows as employees, instead of one per record).
         {"$group": {
-            "_id": "$emp.department",
+            "_id": "$emp_code",
             "present_days": {"$sum": present_credit(weekend_dates(first, next_first))},
             "hours_records": {"$sum": {"$cond": [counts_for_avg, 1, 0]}},
             "hours_in_hundredths": {"$sum": {"$cond": [counts_for_avg, hundredths("$work_hours"), 0]}},
@@ -606,6 +607,11 @@ def department_activity_pipeline(first: date, next_first: date, department: Opti
             "leave_count": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
             "on_duty_count": {"$sum": {"$cond": [{"$eq": ["$status", "ON_DUTY"]}, 1, 0]}},
         }},
+        {"$lookup": {"from": "employees", "localField": "_id", "foreignField": "emp_code", "as": "emp"}},
+        {"$unwind": "$emp"},
+        {"$match": employee_filter},
+        # Step 2: add the per-employee totals up into their department.
+        {"$group": {"_id": "$emp.department", **{name: {"$sum": f"${name}"} for name in totals}}},
     ]
 
 
@@ -793,7 +799,7 @@ def department_trend(
     } for r in rows]}
 
 
-
+ 
 # Admin: explain
  
 ExplainTarget = Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard",
